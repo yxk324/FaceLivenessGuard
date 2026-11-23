@@ -1,0 +1,25 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 模型、权重、数据集（你这个rPPG活体项目重点）
+*.pth
+*.onnx
+*.pt
+*.ckpt
+datasets/
+samples/
+*.mp4
+*.avi
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 日志、输出
+logs/
+runs/
+output/
