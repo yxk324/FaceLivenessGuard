@@ -3,74 +3,188 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PulseProof 主动光活体检测</title>
+  <title>PulseProof 主动光活体检测系统</title>
   <style>
+    * { box-sizing: border-box; }
     body {
-      margin: 0; height: 100vh; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; background: #121418;
-      color: #fff; font-family: system-ui, sans-serif; transition: background-color 0.03s linear;
+      margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; background: #111318;
+      color: #f0f4f8; font-family: system-ui, -apple-system, sans-serif;
+      padding: 20px;
     }
     .cam-box {
-      width: 280px; height: 280px; border-radius: 50%; overflow: hidden;
-      border: 4px solid rgba(255,255,255,0.85); box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+      width: 260px; height: 260px; border-radius: 50%; overflow: hidden;
+      border: 4px solid rgba(255, 255, 255, 0.9); box-shadow: 0 10px 35px rgba(0,0,0,0.45);
+      background: #000;
     }
     video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+    .controls { margin-top: 20px; display: flex; gap: 12px; }
     button {
-      margin-top: 24px; padding: 12px 32px; font-size: 16px; font-weight: 600;
-      border: none; border-radius: 8px; background: #00dc78; color: #0a1912; cursor: pointer;
+      padding: 11px 26px; font-size: 15px; font-weight: 600; border: none;
+      border-radius: 8px; background: #00dc78; color: #081c12; cursor: pointer;
     }
-    button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
-    #status { margin-top: 18px; font-size: 15px; text-align: center; max-width: 90%; line-height: 1.5; }
+    button.secondary { background: rgba(255,255,255,0.16); color: #fff; }
+    button:disabled { background: #4a5058; color: #9aa2ac; cursor: not-allowed; }
+    #statusCard {
+      margin-top: 16px; padding: 12px 18px; border-radius: 10px;
+      background: rgba(17, 19, 24, 0.78); backdrop-filter: blur(6px);
+      font-size: 14px; text-align: center; max-width: 680px; line-height: 1.6;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    #diagPanel {
+      display: none; margin-top: 18px; width: 100%; max-width: 780px;
+      background: rgba(17, 19, 24, 0.88); border-radius: 12px; padding: 16px;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    .chart-title { font-size: 13px; color: #a8b3cf; margin: 8px 0 4px; }
+    canvas.plot { width: 100%; height: 110px; background: #0b0d11; border-radius: 6px; display: block; }
   </style>
 </head>
 <body>
   <div class="cam-box"><video id="video" autoplay playsinline muted></video></div>
-  <button id="startBtn" disabled>正在启动摄像头...</button>
-  <div id="status">请将面部置于圆形取景框中央</div>
+
+  <div class="controls">
+    <button id="startBtn" disabled>正在启动摄像头...</button>
+    <button id="toggleDiagBtn" class="secondary" style="display:none;">显示/隐藏信号诊断图</button>
+  </div>
+
+  <div id="statusCard">请保持面部正对摄像头，避免头顶强光直射额头</div>
+
+  <div id="diagPanel">
+    <div class="chart-title">1. 主动屏幕光激励波 (虚线) vs. 面部皮肤接收调制波 (实线)</div>
+    <canvas id="chartChallenge" class="plot" width="740" height="110"></canvas>
+
+    <div class="chart-title" id="bvpTitle">2. NLMS + 三通道 SVD 剥离屏幕光后的残差脉搏波 (额头 / 左颊 / 右颊)</div>
+    <canvas id="chartBvp" class="plot" width="740" height="110"></canvas>
+
+    <div class="chart-title" id="psdTitle">3. 残差 BVP 功率谱密度 (PSD) 与生理心率主峰 (0.7 - 3.0 Hz)</div>
+    <canvas id="chartPsd" class="plot" width="740" height="110"></canvas>
+  </div>
+
   <canvas id="grabCanvas" width="320" height="240" style="display:none;"></canvas>
 
   <script>
     const video = document.getElementById("video");
     const startBtn = document.getElementById("startBtn");
-    const statusEl = document.getElementById("status");
-    const canvas = document.getElementById("grabCanvas");
-    const ctx = canvas.getContext("2d");
+    const toggleDiagBtn = document.getElementById("toggleDiagBtn");
+    const statusCard = document.getElementById("statusCard");
+    const diagPanel = document.getElementById("diagPanel");
+    const grabCanvas = document.getElementById("grabCanvas");
+    const grabCtx = grabCanvas.getContext("2d");
+
+    let activeCameraLabel = "";
 
     navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" } })
       .then(stream => {
         video.srcObject = stream;
+        const track = stream.getVideoTracks()[0];
+        activeCameraLabel = track ? track.label : "";
         startBtn.disabled = false;
         startBtn.textContent = "开始 3 秒活体检测";
       })
-      .catch(err => { statusEl.textContent = "摄像头权限获取失败: " + err.message; });
+      .catch(err => { statusCard.textContent = "摄像头启动失败: " + err.message; });
+
+    toggleDiagBtn.onclick = () => {
+      diagPanel.style.display = diagPanel.style.display === "none" ? "block" : "none";
+    };
+
+    function drawSeries(canvasId, seriesList, colors, dashedList = []) {
+      const c = document.getElementById(canvasId);
+      const ctx = c.getContext("2d");
+      const w = c.width, h = c.height;
+      ctx.clearRect(0, 0, w, h);
+
+      // 中线
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+
+      seriesList.forEach((arr, idx) => {
+        if (!arr || arr.length < 2) return;
+        const minV = Math.min(...arr), maxV = Math.max(...arr);
+        const span = (maxV - minV) || 1;
+        ctx.strokeStyle = colors[idx];
+        ctx.lineWidth = 2;
+        ctx.setLineDash(dashedList[idx] ? [5, 4] : []);
+        ctx.beginPath();
+        arr.forEach((val, i) => {
+          const x = (i / (arr.length - 1)) * (w - 20) + 10;
+          const y = h - 12 - ((val - minV) / span) * (h - 24);
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+
+    function drawPsd(freqs, psd, estBpm) {
+      const c = document.getElementById("chartPsd");
+      const ctx = c.getContext("2d");
+      const w = c.width, h = c.height;
+      ctx.clearRect(0, 0, w, h);
+      if (!freqs || freqs.length < 2) return;
+
+      ctx.strokeStyle = "#00dc78";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      psd.forEach((val, i) => {
+        const x = (i / (psd.length - 1)) * (w - 20) + 10;
+        const y = h - 14 - val * (h - 28);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      document.getElementById("psdTitle").textContent =
+        `3. 残差 BVP 功率谱密度 (PSD) — 估算静息心率: ${estBpm} BPM`;
+    }
 
     startBtn.onclick = async () => {
       startBtn.disabled = true;
-      statusEl.textContent = "正在请求随机挑战序列...";
+      statusCard.textContent = "正在生成随机光学挑战序列...";
 
       const res = await fetch("/api/challenge?num_frames=75&fps=25", { method: "POST" });
       const challenge = await res.json();
       const colors = challenge.colors;
+      const frameIntervalMs = 1000 / challenge.fps;
+
       const framesB64 = [];
+      const timestampsMs = [];
+      const renderedColors = [];
 
-      const intervalMs = 1000 / challenge.fps;
-      const tStart = performance.now();
+      // 使用 requestAnimationFrame 实现与浏览器刷新率同步的精准打光与抓帧
+      await new Promise(resolve => {
+        let idx = 0;
+        let lastStepTime = performance.now();
+        const [r0, g0, b0] = colors[0];
+        document.body.style.backgroundColor = `rgb(${r0}, ${g0}, ${b0})`;
 
-      for (let i = 0; i < colors.length; i++) {
-        const [r, g, b] = colors[i];
-        document.body.style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
-        statusEl.textContent = `活体挑战进行中... ${i + 1}/${colors.length}`;
+        function step(now) {
+          if (idx >= colors.length) {
+            resolve();
+            return;
+          }
+          if (now - lastStepTime >= frameIntervalMs) {
+            lastStepTime = now;
+            const currentColor = colors[idx];
+            grabCtx.drawImage(video, 0, 0, grabCanvas.width, grabCanvas.height);
+            framesB64.push(grabCanvas.toDataURL("image/jpeg", 0.92));
+            timestampsMs.push(now);
+            renderedColors.push(currentColor);
 
-        // 等待一帧画面渲染稳定后抓拍
-        await new Promise(resolve => setTimeout(resolve, intervalMs));
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        framesB64.push(canvas.toDataURL("image/jpeg", 0.8));
-      }
+            idx++;
+            statusCard.textContent = `活体挑战进行中... ${idx}/${colors.length}`;
+            if (idx < colors.length) {
+              const [r, g, b] = colors[idx];
+              document.body.style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
+            }
+          }
+          requestAnimationFrame(step);
+        }
+        requestAnimationFrame(step);
+      });
 
-      const elapsedSec = (performance.now() - tStart) / 1000;
-      const actualFps = framesB64.length / elapsedSec;
-      document.body.style.backgroundColor = "#121418";
-      statusEl.textContent = "正在上传至后端进行 rPPG 残差解析...";
+      document.body.style.backgroundColor = "#111318";
+      const actualFps = framesB64.length / ((timestampsMs[timestampsMs.length - 1] - timestampsMs[0]) / 1000);
+      statusCard.textContent = "正在上传至后端进行时间戳对齐与 rPPG 残差解析...";
 
       const verifyRes = await fetch("/api/verify", {
         method: "POST",
@@ -78,11 +192,30 @@
         body: JSON.stringify({
           session_id: challenge.session_id,
           fps: actualFps,
-          frames_b64: framesB64
+          frames_b64: framesB64,
+          timestamps_ms: timestampsMs,
+          rendered_colors: renderedColors,
+          camera_label: activeCameraLabel
         })
       });
       const result = await verifyRes.json();
-      statusEl.textContent = JSON.stringify(result);
+
+      if (result.live) {
+        statusCard.innerHTML = `<strong style="color:#00dc78;">[活体通过]</strong> 综合评分: <b>${result.liveness_score}</b> | 挑战相关: ${result.challenge_corr} | 空间同步: ${result.spatial_sync} | SpecDiff比: ${result.spec_ratio} | 心率: <b>${result.residual_bpm} BPM</b>`;
+      } else {
+        statusCard.innerHTML = `<strong style="color:#ff5252;">[拦截 / 重试]</strong> 原因: <b>${result.reason}</b> | 挑战相关: ${result.challenge_corr ?? "N/A"} | 空间同步: ${result.spatial_sync ?? "N/A"} | 综合评分: ${result.liveness_score ?? "N/A"}`;
+      }
+
+      if (result.diagnostics) {
+        toggleDiagBtn.style.display = "inline-block";
+        diagPanel.style.display = "block";
+        document.getElementById("bvpTitle").textContent =
+          `2. 残差脉搏波 (算法: ${result.diagnostics.bvp_method} | 额头:绿 / 左颊:蓝 / 右颊:黄)`;
+        drawSeries("chartChallenge", [result.diagnostics.sent_wave, result.diagnostics.skin_wave], ["#94a3b8", "#38bdf8"], [true, false]);
+        drawSeries("chartBvp", result.diagnostics.bvp_rois, ["#00dc78", "#38bdf8", "#facc15"]);
+        drawPsd(result.diagnostics.fft_freqs, result.diagnostics.fft_psd, result.residual_bpm);
+      }
+
       startBtn.disabled = false;
     };
   </script>
